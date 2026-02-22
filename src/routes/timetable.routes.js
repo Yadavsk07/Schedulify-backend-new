@@ -213,6 +213,130 @@ function runCpSatSolver(payload) {
   });
 }
 
+function runHeuristicSolver(payload) {
+  const {
+    days,
+    periodsByDay,
+    requirements,
+    teachers,
+    labIds
+  } = payload;
+
+  const teacherMax = new Map(teachers.map((t) => [t.id, Number(t.maxPeriodsPerWeek || 0)]));
+  const teacherUnavailable = new Map(teachers.map((t) => [t.id, t.unavailable || {}]));
+  const teacherLoad = new Map(teachers.map((t) => [t.id, 0]));
+
+  const classBusy = new Set();
+  const teacherBusy = new Set();
+  const labBusy = new Set();
+  const slots = [];
+  const unscheduled = [];
+
+  const ordered = [...requirements].sort((a, b) => {
+    const aBlock = a.requiresConsecutive ? Math.max(2, Number(a.consecutiveSize || 2)) : 1;
+    const bBlock = b.requiresConsecutive ? Math.max(2, Number(b.consecutiveSize || 2)) : 1;
+    if (bBlock !== aBlock) return bBlock - aBlock;
+    return Number(b.periodsPerWeek || 0) - Number(a.periodsPerWeek || 0);
+  });
+
+  const pickLab = (day, period) => {
+    for (const lab of labIds) {
+      if (!labBusy.has(`${lab}|${day}|${period}`)) return lab;
+    }
+    return "";
+  };
+
+  for (const req of ordered) {
+    const tId = req.teacherId;
+    const total = Number(req.periodsPerWeek || 0);
+    const block = req.requiresConsecutive ? Math.max(2, Number(req.consecutiveSize || 2)) : 1;
+    const needsLab = ["LAB", "LABROOM"].includes(String(req.roomType || "").toUpperCase());
+    let remaining = total;
+
+    const tryPlaceBlock = (size) => {
+      for (const day of days) {
+        const maxP = Number(periodsByDay[day] || 0);
+        for (let start = 0; start + size <= maxP; start += 1) {
+          let ok = true;
+          const placements = [];
+          for (let p = start; p < start + size; p += 1) {
+            if (classBusy.has(`${req.classGroupId}|${req.sectionId}|${day}|${p}`)) {
+              ok = false;
+              break;
+            }
+            if (teacherBusy.has(`${tId}|${day}|${p}`)) {
+              ok = false;
+              break;
+            }
+            if ((teacherUnavailable.get(tId)?.[day] || []).includes(p)) {
+              ok = false;
+              break;
+            }
+            const current = teacherLoad.get(tId) || 0;
+            const cap = teacherMax.get(tId) || 0;
+            if (current + size > cap) {
+              ok = false;
+              break;
+            }
+            let labRoomId = "";
+            if (needsLab) {
+              labRoomId = pickLab(day, p);
+              if (!labRoomId) {
+                ok = false;
+                break;
+              }
+            }
+            placements.push({ day, period: p, labRoomId });
+          }
+          if (!ok) continue;
+
+          for (const s of placements) {
+            classBusy.add(`${req.classGroupId}|${req.sectionId}|${s.day}|${s.period}`);
+            teacherBusy.add(`${tId}|${s.day}|${s.period}`);
+            if (s.labRoomId) labBusy.add(`${s.labRoomId}|${s.day}|${s.period}`);
+            slots.push({
+              classGroupId: req.classGroupId,
+              sectionId: req.sectionId,
+              day: s.day,
+              period: s.period,
+              subjectId: req.subjectId,
+              teacherId: tId,
+              labRoomId: s.labRoomId || "",
+              roomType: req.roomType || "CLASSROOM"
+            });
+          }
+          teacherLoad.set(tId, (teacherLoad.get(tId) || 0) + size);
+          return true;
+        }
+      }
+      return false;
+    };
+
+    while (remaining > 0) {
+      let size = block;
+      if (remaining < size) size = 1;
+      if (!tryPlaceBlock(size)) break;
+      remaining -= size;
+    }
+
+    if (remaining > 0) {
+      unscheduled.push({
+        classGroupId: req.classGroupId,
+        sectionId: req.sectionId,
+        subjectId: req.subjectId,
+        teacherId: req.teacherId,
+        remaining
+      });
+    }
+  }
+
+  return {
+    ok: unscheduled.length === 0,
+    slots,
+    unscheduled
+  };
+}
+
 function buildValidationReport({ classes, mappings, teachers, settings, labs }) {
   const days = getSchedulingDays();
   const periodsPerDay = Number(settings?.periodsPerDay || 8);
@@ -523,38 +647,63 @@ router.post("/generate/school/:schoolId", requireAuth, requireRole("ADMIN"), ens
     labIds: labs.map((l) => l.id),
     timeLimitSec: Number(process.env.CP_SAT_TIME_LIMIT_SEC || 25)
   };
+  const enableCpSat = String(process.env.ENABLE_CP_SAT || "false").toLowerCase() === "true";
 
-  const cpSat = await runCpSatSolver(cpSatInput);
-  if (cpSat?.ok && Array.isArray(cpSat.slots)) {
-    await TimetableSlot.deleteMany({ schoolId });
-    const docs = cpSat.slots.map((s) => ({
-      schoolId,
-      classGroupId: s.classGroupId,
-      sectionId: s.sectionId,
-      day: s.day,
-      period: Number(s.period),
-      subjectId: s.subjectId,
-      teacherId: s.teacherId,
-      labRoomId: s.labRoomId || "",
-      roomType: s.roomType || "CLASSROOM",
-      locked: false
-    }));
-    if (docs.length) await TimetableSlot.insertMany(docs, { ordered: false });
-    return res.json({
-      message: `Timetable generated using CP-SAT. Slots: ${docs.length}.`,
-      solver: "CP-SAT",
-      autoMappingsCreated: autoMapResult.created,
-      warnings: Array.from(new Set([...(autoMapResult.warnings || []), ...((cpSat.warnings || []))]))
+  if (enableCpSat) {
+    const cpSat = await runCpSatSolver(cpSatInput);
+    if (cpSat?.ok && Array.isArray(cpSat.slots)) {
+      await TimetableSlot.deleteMany({ schoolId });
+      const docs = cpSat.slots.map((s) => ({
+        schoolId,
+        classGroupId: s.classGroupId,
+        sectionId: s.sectionId,
+        day: s.day,
+        period: Number(s.period),
+        subjectId: s.subjectId,
+        teacherId: s.teacherId,
+        labRoomId: s.labRoomId || "",
+        roomType: s.roomType || "CLASSROOM",
+        locked: false
+      }));
+      if (docs.length) await TimetableSlot.insertMany(docs, { ordered: false });
+      return res.json({
+        message: `Timetable generated using CP-SAT. Slots: ${docs.length}.`,
+        solver: "CP-SAT",
+        autoMappingsCreated: autoMapResult.created,
+        warnings: Array.from(new Set([...(autoMapResult.warnings || []), ...((cpSat.warnings || []))]))
+      });
+    }
+  }
+
+  const heuristic = runHeuristicSolver(cpSatInput);
+  if (!heuristic.ok) {
+    return res.status(422).json({
+      error: "Timetable generation failed.",
+      reason: "No complete feasible schedule could be generated with current constraints.",
+      validation,
+      unscheduled: heuristic.unscheduled.slice(0, 50)
     });
   }
 
-  return res.status(422).json({
-    error: "Timetable generation failed.",
-    reason:
-      cpSat?.error === "INFEASIBLE"
-        ? "CP-SAT found no feasible solution with current hard constraints. See validation issues for exact blockers."
-        : cpSat?.error || "CP-SAT solver returned no solution.",
-    validation
+  await TimetableSlot.deleteMany({ schoolId });
+  const docs = heuristic.slots.map((s) => ({
+    schoolId,
+    classGroupId: s.classGroupId,
+    sectionId: s.sectionId,
+    day: s.day,
+    period: Number(s.period),
+    subjectId: s.subjectId,
+    teacherId: s.teacherId,
+    labRoomId: s.labRoomId || "",
+    roomType: s.roomType || "CLASSROOM",
+    locked: false
+  }));
+  if (docs.length) await TimetableSlot.insertMany(docs, { ordered: false });
+  return res.json({
+    message: `Timetable generated using heuristic solver. Slots: ${docs.length}.`,
+    solver: "Heuristic",
+    autoMappingsCreated: autoMapResult.created,
+    warnings: autoMapResult.warnings || []
   });
 });
 
